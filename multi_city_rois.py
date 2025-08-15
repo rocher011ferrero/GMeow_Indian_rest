@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """
-multi_city_rois.py (fixed & hardened)
+multi_city_rois_full.py
 
-Generate ROI reports for many candidate locations (grid) across London and Bath,
-using only public/open data and optional polite scraping.
-
-This version includes robust numeric cleaning and defensive checks to avoid
-errors caused by malformed strings in numeric fields (e.g., FSA 'RatingValue').
+Complete multi-city ROI analysis pipeline (London & Bath example), fully hardened:
+- Grid generation
+- FSA FHRS establishments fetch with caching
+- Optional polite menu scraping
+- Monte Carlo simulations
+- Chart + PDF report generation
+- Heatmap generation per point
+- Parallel processing support
 """
 from __future__ import annotations
 import os
@@ -46,8 +49,8 @@ logger = logging.getLogger("multi_city_rois")
 # Constants & polite defaults
 # -------------------
 USER_AGENT = "roi-research-bot/0.1 (+mailto:you@yourdomain.example)"
-NOMINATIM_SLEEP = 1.0   # seconds between geocode requests (polite)
-SCRAPE_SLEEP = 1.5      # seconds between scrapes (polite)
+NOMINATIM_SLEEP = 1.0   # seconds between geocode requests
+SCRAPE_SLEEP = 1.5      # seconds between scrapes
 FSA_HEADERS = {"x-api-version": "2", "User-Agent": USER_AGENT}
 CACHE_DIRNAME = ".roi_cache"
 
@@ -90,12 +93,9 @@ def cache_save(key: str, obj):
 # Robust numeric conversion helper
 # -------------------
 def safe_to_numeric(series: pd.Series, default: Optional[float] = None) -> pd.Series:
-    """Convert a series to numeric safely; coerce invalid strings to NaN or default."""
-    # If series is not present or empty, return appropriate NaN series
     if series is None:
         s = pd.Series(dtype="float64")
         return s if default is None else s.fillna(default)
-    # Convert to string first to avoid concatenated object issues, but truncate very long strings
     def _truncate(x):
         try:
             if isinstance(x, str) and len(x) > 200:
@@ -125,6 +125,38 @@ def geocode_nominatim(query: str, sleep_sec: float = NOMINATIM_SLEEP):
     out = {"lat": float(loc.latitude), "lng": float(loc.longitude), "address": loc.address}
     cache_save(key, out)
     return out["lat"], out["lng"], out["address"]
+
+# -------------------
+# NEW: Reverse geocoding (cached) + safe label helper
+# -------------------
+def reverse_geocode_name(lat: float, lng: float, sleep_sec: float = NOMINATIM_SLEEP) -> str:
+    """
+    Return a human-readable location name for (lat, lng).
+    Uses Nominatim reverse geocoding with on-disk caching.
+    """
+    key = f"revgeo::{lat:.5f},{lng:.5f}"
+    cached = cache_load(key)
+    if cached and "name" in cached:
+        return cached["name"]
+    geolocator = Nominatim(user_agent=USER_AGENT, timeout=10)
+    rate = RateLimiter(geolocator.reverse, min_delay_seconds=sleep_sec)
+    loc = rate((lat, lng))
+    if loc is None or not getattr(loc, "address", None):
+        name = f"{lat:.5f},{lng:.5f}"
+    else:
+        name = loc.address
+    cache_save(key, {"name": name})
+    return name
+
+def safe_label_from_name(name: str) -> str:
+    """
+    Make a filesystem-safe label from a location name.
+    """
+    safe = name
+    for ch in r'\/:*?"<>|':
+        safe = safe.replace(ch, "_")
+    safe = "_".join(safe.split())  # collapse whitespace to underscores
+    return safe[:120]  # keep it short-ish
 
 # -------------------
 # Generate grid
@@ -167,7 +199,6 @@ def fsa_establishments(lat: float, lng: float, max_km: int = 2) -> pd.DataFrame:
         return pd.DataFrame()
     rows = []
     for e in j.get("establishments", []):
-        # Build safe strings and avoid monstrous concatenations
         address_parts = [e.get(k) for k in ("AddressLine1","AddressLine2","AddressLine3","PostCode") if e.get(k)]
         address = ", ".join(address_parts)
         rows.append({
@@ -175,23 +206,15 @@ def fsa_establishments(lat: float, lng: float, max_km: int = 2) -> pd.DataFrame:
             "fhrs_id": e.get("FHRSID"),
             "lat": e.get("geocode", {}).get("latitude"),
             "lng": e.get("geocode", {}).get("longitude"),
-            "rating_raw": e.get("RatingValue"),   # keep raw string for auditing
+            "rating_raw": e.get("RatingValue"),
             "local_authority": e.get("LocalAuthorityName") or "",
             "address": address,
             "business_type": e.get("BusinessType") or ""
         })
     df = pd.DataFrame(rows)
-    # Clean numeric expected columns
-    if "rating_raw" in df.columns:
-        df["rating"] = safe_to_numeric(df["rating_raw"], default=np.nan)
-    else:
-        df["rating"] = np.nan
-    # Guard lat/lng
-    if "lat" in df.columns:
-        df["lat"] = safe_to_numeric(df["lat"], default=np.nan)
-    if "lng" in df.columns:
-        df["lng"] = safe_to_numeric(df["lng"], default=np.nan)
-    # Save cache as records (JSON-serializable)
+    df["rating"] = safe_to_numeric(df.get("rating_raw"), default=np.nan)
+    df["lat"] = safe_to_numeric(df.get("lat"), default=np.nan)
+    df["lng"] = safe_to_numeric(df.get("lng"), default=np.nan)
     try:
         cache_save(cache_key, df.to_dict(orient="records"))
     except Exception:
@@ -243,14 +266,35 @@ def scrape_menu_prices(url: str) -> Dict:
 # Infer priors from competitor signals and optional menu scrapes
 # -------------------
 def infer_priors_from_data(df_places: pd.DataFrame, menu_scrapes: List[Dict]) -> Dict:
+    """
+    Robustly infer priors. Cleans ratings to protect against non-numeric FHRS values
+    like 'AwaitingInspection', 'Exempt', or concatenated junk strings.
+    """
     priors: Dict[str, float] = {}
+
+    # 1) Try to use menu-derived spend if available
     medians = [s["median_price"] for s in menu_scrapes if s and "median_price" in s]
     if medians:
         priors["avg_spend_mean"] = float(np.mean(medians)) * 1.6
         priors["avg_spend_sd"] = max(1.5, 0.2 * priors["avg_spend_mean"])
     else:
-        if not df_places.empty and "rating" in df_places.columns and df_places["rating"].dropna().size > 0:
-            avg_rating = float(df_places["rating"].dropna().mean())
+        # 2) Use ratings as a proxy for spend level (after strict cleaning)
+        ratings_src = None
+        if "rating" in df_places.columns:
+            ratings_src = df_places["rating"]
+        elif "rating_raw" in df_places.columns:
+            ratings_src = df_places["rating_raw"]
+
+        avg_rating = np.nan
+        if ratings_src is not None:
+            ratings_clean = pd.to_numeric(ratings_src, errors="coerce")
+            # Remove inf/-inf and keep within FHRS-like [0, 5]
+            ratings_clean = ratings_clean.replace([np.inf, -np.inf], np.nan)
+            ratings_clean = ratings_clean[(ratings_clean >= 0) & (ratings_clean <= 5)]
+            if ratings_clean.notna().any():
+                avg_rating = float(ratings_clean.mean())
+
+        if not np.isnan(avg_rating):
             base = 14.0 + (avg_rating - 3.5) * 4.0
             priors["avg_spend_mean"] = base
             priors["avg_spend_sd"] = max(2.5, 0.25 * base)
@@ -258,9 +302,17 @@ def infer_priors_from_data(df_places: pd.DataFrame, menu_scrapes: List[Dict]) ->
             priors["avg_spend_mean"] = 18.0
             priors["avg_spend_sd"] = 4.0
 
+    # 3) Customers/day heuristic
     if "user_ratings_total" in df_places.columns and df_places["user_ratings_total"].dropna().size > 0:
-        avg_reviews = float(df_places["user_ratings_total"].replace({0:np.nan}).dropna().mean() or 100)
-        customers_mean = max(20, (avg_reviews * 100.0) / 365.0)
+        try:
+            urt = pd.to_numeric(df_places["user_ratings_total"], errors="coerce").replace({0: np.nan})
+            if urt.dropna().size > 0:
+                avg_reviews = float(urt.dropna().mean())
+            else:
+                avg_reviews = 100.0
+        except Exception:
+            avg_reviews = 100.0
+        customers_mean = max(20.0, (avg_reviews * 100.0) / 365.0)
         priors["customers_per_day_mean"] = customers_mean
         priors["customers_per_day_sd"] = max(10.0, 0.25 * customers_mean)
     else:
@@ -275,6 +327,7 @@ def infer_priors_from_data(df_places: pd.DataFrame, menu_scrapes: List[Dict]) ->
             priors["customers_per_day_mean"] = 90.0
             priors["customers_per_day_sd"] = 30.0
 
+    # 4) Cost priors
     priors["food_cost_pct_mean"] = 0.30
     priors["food_cost_pct_sd"] = 0.05
     priors["labor_cost_pct_mean"] = 0.28
@@ -283,7 +336,7 @@ def infer_priors_from_data(df_places: pd.DataFrame, menu_scrapes: List[Dict]) ->
     return priors
 
 # -------------------
-# Monte Carlo simulation (vectorized)
+# Monte Carlo simulation
 # -------------------
 def run_monte_carlo(n_sims: int,
                     days_open_per_year: int,
@@ -324,7 +377,7 @@ def run_monte_carlo(n_sims: int,
     return df
 
 # -------------------
-# Plotting & report helpers
+# Plotting helpers
 # -------------------
 def plot_simulation_charts(sim_df: pd.DataFrame, out_prefix: str) -> List[str]:
     charts = []
@@ -356,6 +409,9 @@ def plot_simulation_charts(sim_df: pd.DataFrame, out_prefix: str) -> List[str]:
 
     return charts
 
+# -------------------
+# PDF report builder
+# -------------------
 def build_pdf_report(title: str, location_label: str, charts: List[str], heatmap_html: Optional[str], summary_csv: str, out_pdf: str):
     c = canvas.Canvas(out_pdf, pagesize=A4)
     w, h = A4
@@ -387,7 +443,7 @@ def build_pdf_report(title: str, location_label: str, charts: List[str], heatmap
     c.save()
 
 # -------------------
-# Process a single grid point: main worker
+# Process a single grid point
 # -------------------
 def process_point(args_tuple):
     (lat, lon, city, idx, params) = args_tuple
@@ -399,7 +455,16 @@ def process_point(args_tuple):
     other_fixed_per_year = params["other_fixed_per_year"]
     capex = params["capex"]
     menu_sample_urls = params.get("menu_sample_urls", [])
-    label = f"{city}_{idx}_{lat:.5f}_{lon:.5f}"
+
+    # --- derive human-readable name from coordinates ---
+    try:
+        place_name = reverse_geocode_name(lat, lon)
+    except Exception as _e:
+        place_name = f"{lat:.5f},{lon:.5f}"
+    safe_place = safe_label_from_name(place_name)
+
+    # Use the place name (not london_75/city_idx) in outputs
+    label = f"{safe_place}_{lat:.5f}_{lon:.5f}"
     prefix = os.path.join(output_dir, label)
     ensure_dir(output_dir)
 
@@ -418,86 +483,36 @@ def process_point(args_tuple):
                 logger.debug("Menu scrape failure for %s: %s", url, e)
 
         priors = infer_priors_from_data(fsa_df, menu_scrapes)
-
-        sim_df = run_monte_carlo(n_sims=n_sims,
-                                 days_open_per_year=days_open,
-                                 avg_spend_mean=priors["avg_spend_mean"], avg_spend_sd=priors["avg_spend_sd"],
-                                 customers_mean=priors["customers_per_day_mean"], customers_sd=priors["customers_per_day_sd"],
-                                 food_cost_pct_mean=priors["food_cost_pct_mean"], food_cost_pct_sd=priors["food_cost_pct_sd"],
-                                 labor_cost_pct_mean=priors["labor_cost_pct_mean"], labor_cost_pct_sd=priors["labor_cost_pct_sd"],
-                                 rent_per_year=rent_per_year, other_fixed_per_year=other_fixed_per_year, capex=capex)
-
-        sim_csv = prefix + "_simulations.csv"
-        sim_df.to_csv(sim_csv, index=False)
-        summary = sim_df.describe(percentiles=[0.05,0.25,0.5,0.75,0.95])
-        summary_csv = prefix + "_sim_summary.csv"
-        summary.to_csv(summary_csv)
-
-        fsa_out = prefix + "_places.csv"
-        if not fsa_df.empty:
-            fsa_df.to_csv(fsa_out, index=False)
-
+        sim_df = run_monte_carlo(n_sims, days_open,
+                                 priors["avg_spend_mean"], priors["avg_spend_sd"],
+                                 priors["customers_per_day_mean"], priors["customers_per_day_sd"],
+                                 priors["food_cost_pct_mean"], priors["food_cost_pct_sd"],
+                                 priors["labor_cost_pct_mean"], priors["labor_cost_pct_sd"],
+                                 rent_per_year, other_fixed_per_year, capex)
+        summary_csv = f"{prefix}_summary.csv"
+        sim_df.to_csv(summary_csv, index=False)
         charts = plot_simulation_charts(sim_df, prefix)
 
-        heatmap_html = ""
+        # Heatmap
+        m = folium.Map(location=[lat, lon], zoom_start=15)
         if not fsa_df.empty:
-            try:
-                gdf = gpd.GeoDataFrame(fsa_df.dropna(subset=["lat","lng"]),
-                                       geometry=fsa_df.dropna(subset=["lat","lng"]).apply(lambda r: Point(float(r["lng"]), float(r["lat"])), axis=1),
-                                       crs="EPSG:4326")
-                heatmap_html = prefix + "_heatmap.html"
-                m = folium.Map(location=[lat, lon], zoom_start=15, tiles="OpenStreetMap")
-                coords = [[pt.y, pt.x] for pt in gdf.geometry]
-                if coords:
-                    HeatMap(coords, radius=12, blur=15, max_zoom=16).add_to(m)
-                for _, r in gdf.iterrows():
-                    folium.CircleMarker(location=[r.geometry.y, r.geometry.x], radius=3,
-                                        popup=f'{r.get("name","")} (rating={r.get("rating")})').add_to(m)
-                m.save(heatmap_html)
-            except Exception as e:
-                logger.debug("Heatmap generation failed: %s", e)
-                heatmap_html = ""
+            heat_data = [[row["lat"], row["lng"]] for idx,row in fsa_df.iterrows() if not pd.isna(row["lat"]) and not pd.isna(row["lng"])]
+            if heat_data:
+                HeatMap(heat_data).add_to(m)
+        heatmap_html = f"{prefix}_heatmap.html"
+        m.save(heatmap_html)
 
-        pdf_out = prefix + ".pdf"
-        build_pdf_report("Indian Restaurant ROI Report (no-key)", f"{city} @{lat:.5f},{lon:.5f}", charts, heatmap_html, summary_csv, pdf_out)
-
-        # safe extraction of summary statistics
-        def safe_get_summary(stat, col):
-            try:
-                return float(summary.loc[stat, col])
-            except Exception:
-                return float("nan")
-
-        median_revenue = safe_get_summary("50%", "revenue")
-        median_ebitda = safe_get_summary("50%", "ebitda")
-        median_roi = safe_get_summary("50%", "roi")
-        median_payback = safe_get_summary("50%", "payback_years")
-        competitor_count = len(fsa_df) if not fsa_df.empty else 0
-
-        summary_row = {
-            "city": city,
-            "idx": idx,
-            "lat": lat,
-            "lon": lon,
-            "median_revenue": median_revenue,
-            "median_ebitda": median_ebitda,
-            "median_roi": median_roi,
-            "median_payback_years": median_payback,
-            "competitor_count": competitor_count,
-            "fsa_csv": fsa_out if not fsa_df.empty else "",
-            "sim_csv": sim_csv,
-            "summary_csv": summary_csv,
-            "pdf": pdf_out,
-            "heatmap_html": heatmap_html or ""
-        }
-        logger.info("Processed %s: median_revenue=%.0f median_roi=%.3f competitors=%d", label, (median_revenue or 0.0), (median_roi or 0.0), competitor_count)
-        return summary_row
+        pdf_file = f"{prefix}_report.pdf"
+        # show the human-readable place in the PDF header
+        build_pdf_report("ROI Simulation Report", f"{place_name} ({lat:.5f},{lon:.5f})", charts, heatmap_html, summary_csv, pdf_file)
+        logger.info("Completed point %s: PDF %s", label, pdf_file)
+        return pdf_file
     except Exception as e:
-        logger.exception("Processing failed for point %s,%s (%s): %s", lat, lon, city, e)
-        return {"city": city, "idx": idx, "lat": lat, "lon": lon, "error": str(e)}
+        logger.exception("Failed processing point %s: %s", label, e)
+        return None
 
 # -------------------
-# Main orchestrator
+# Main CLI entry
 # -------------------
 def main():
     p = argparse.ArgumentParser(description="Grid-level multi-location ROI pipeline (London & Bath example)")
@@ -529,7 +544,7 @@ def main():
         pts = generate_grid_for_bbox(min_lat, max_lat, min_lon, max_lon, spacing_m=args.grid_m)
         logger.info("City %s -> %d grid points (spacing %dm)", city, len(pts), args.grid_m)
         for idx, (lat, lon) in enumerate(pts):
-            all_points.append((lat, lon, city, idx, {
+            params_dict = {
                 "output_dir": args.output_dir,
                 "radius_m": args.radius_m,
                 "n_sims": args.n_sims,
@@ -538,15 +553,17 @@ def main():
                 "other_fixed_per_year": args.other_fixed_per_year,
                 "capex": args.capex,
                 "menu_sample_urls": menu_sample_urls
-            }))
+            }
+            all_points.append((lat, lon, city, idx, params_dict))
 
     logger.info("Starting processing of %d points with %d workers", len(all_points), args.parallel)
     results = []
+
+    # Use imap_unordered to safely handle argument tuples in multiprocessing
     if args.parallel <= 1:
         for a in all_points:
             results.append(process_point(a))
     else:
-        # limit pool size to avoid too many concurrent HTTP calls
         with mp.Pool(processes=args.parallel) as pool:
             for r in pool.imap_unordered(process_point, all_points):
                 results.append(r)
